@@ -1,0 +1,7 @@
+import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
+import type { User } from '@supabase/supabase-js';
+import { getSupabase } from '../services';
+interface AuthValue { user: User | null; loading: boolean; signIn: (email: string, password: string) => Promise<void>; signOut: () => Promise<void> }
+const AuthContext = createContext<AuthValue | null>(null);
+export function AuthProvider({ children }: { children: ReactNode }) { const client = getSupabase(); const [user,setUser] = useState<User|null>(null); const [loading,setLoading] = useState(Boolean(client)); useEffect(() => { if (!client) return; void client.auth.getUser().then(({ data }) => { setUser(data.user); setLoading(false); }); const { data } = client.auth.onAuthStateChange((_event, session) => setUser(session?.user ?? null)); return () => data.subscription.unsubscribe(); }, [client]); const value: AuthValue = { user, loading, signIn: async (email,password) => { if (!client) throw new Error('Supabase is not configured.'); const { error } = await client.auth.signInWithPassword({ email,password }); if (error) throw new Error(error.message); }, signOut: async () => { if (client) { const { error } = await client.auth.signOut(); if (error) throw new Error(error.message); } } }; return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>; }
+export function useAuth() { const value = useContext(AuthContext); if (!value) throw new Error('AuthProvider is missing'); return value; }
