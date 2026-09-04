@@ -3,40 +3,43 @@ import type { ComplianceRule, ExtractedField, FieldName, OCRResponse, OCRRegion 
 export function validateOCRResponse(value: unknown): OCRResponse {
   if (!value || typeof value !== 'object') throw new Error('OCR response is not an object');
   const raw = value as Record<string, unknown>;
-  if (!Array.isArray(raw.regions) || typeof raw.imageWidth !== 'number' || typeof raw.imageHeight !== 'number' || typeof raw.engine !== 'string') throw new Error('Invalid OCR response shape');
-  const regions = raw.regions.map((region) => {
-    if (!region || typeof region !== 'object') throw new Error('Invalid OCR region');
-    const item = region as Record<string, unknown>;
-    const bbox = item.bbox as Record<string, unknown> | undefined;
-    if (typeof item.text !== 'string' || typeof item.confidence !== 'number' || !bbox || !['x','y','width','height'].every((key) => typeof bbox[key] === 'number')) throw new Error('Invalid OCR region shape');
-    return { text: item.text, confidence: item.confidence, bbox: { x: bbox.x as number, y: bbox.y as number, width: bbox.width as number, height: bbox.height as number } } satisfies OCRRegion;
+  if (!Array.isArray(raw.regions) || !Number.isFinite(raw.imageWidth) || !Number.isFinite(raw.imageHeight) || typeof raw.engine !== 'string') throw new Error('Invalid OCR response shape');
+  const regions = raw.regions.map((candidate) => {
+    if (!candidate || typeof candidate !== 'object') throw new Error('Invalid OCR region');
+    const region = candidate as Record<string, unknown>;
+    const bbox = region.bbox;
+    if (typeof region.text !== 'string' || typeof region.confidence !== 'number' || !Array.isArray(bbox) || bbox.length !== 4 || bbox.some((point) => typeof point !== 'number' || !Number.isFinite(point))) throw new Error('Invalid OCR region shape: bbox must be [x1,y1,x2,y2]');
+    const [x1, y1, x2, y2] = bbox as number[];
+    if (x2 < x1 || y2 < y1) throw new Error('Invalid OCR bbox coordinates');
+    return { text: region.text, confidence: Math.max(0, Math.min(1, region.confidence)), bbox: { x: x1, y: y1, width: x2 - x1, height: y2 - y1 } } satisfies OCRRegion;
   });
-  return { regions, imageWidth: raw.imageWidth, imageHeight: raw.imageHeight, engine: raw.engine } as OCRResponse;
+  return { regions, imageWidth: raw.imageWidth as number, imageHeight: raw.imageHeight as number, engine: raw.engine };
 }
 
 const definitions: Array<[FieldName, string, RegExp]> = [
-  ['manufacturer', 'Manufacturer', /(?:mfg|manufactured by|manufacturer)\s*[:\-]?\s*(.+)/i],
-  ['productName', 'Product name', /(?:product|name)\s*[:\-]?\s*(.+)/i],
+  ['productName', 'Product name', /(?:product\s*name|product|name)\s*[:\-]?\s*(.+)/i],
+  ['mrp', 'MRP', /(?:mrp|max(?:imum)? retail price)\s*[:\-]?\s*(?:₹|rs\.?|inr)?\s*([\d,.]+)/i],
   ['netQuantity', 'Net quantity', /(?:net quantity|net qty)\s*[:\-]?\s*([\w. ]+)/i],
-  ['unit', 'Unit', /([0-9]+\s*(?:g|kg|ml|l|pcs|piece)s?)/i],
-  ['mrp', 'MRP', /(?:mrp|max retail price)\s*[:\-]?\s*(?:₹|rs\.?|inr)?\s*([\d,.]+)/i],
-  ['packDate', 'Pack date', /(?:packed|pack date|date of packing)\s*[:\-]?\s*(\S+)/i],
-  ['batchNumber', 'Batch number', /(?:batch|lot)\s*(?:no|number)?\s*[:\-]?\s*(\w[\w-]*)/i],
-  ['customerCare', 'Customer care', /(?:customer care|helpline|contact)\s*[:\-]?\s*(.+)/i],
-  ['origin', 'Country of origin', /(?:country of origin|made in)\s*[:\-]?\s*(.+)/i],
-  ['licenseNumber', 'License number', /(?:license|licence)\s*(?:no|number)?\s*[:\-]?\s*(\w[\w/-]*)/i],
-  ['standardMark', 'Standard mark', /\b(isi|agmark|fssai|bis)\b/i],
+  ['unitSalePrice', 'Unit sale price', /(?:unit sale price|price per unit|unit price)\s*[:\-]?\s*(?:₹|rs\.?|inr)?\s*([\d,.]+)/i],
+  ['manufacturer', 'Manufacturer', /(?:manufactured by|manufacturer|mfg)\s*[:\-]?\s*(.+)/i],
+  ['packer', 'Packer', /(?:packed by|packer)\s*[:\-]?\s*(.+)/i],
+  ['importer', 'Importer', /(?:imported by|importer)\s*[:\-]?\s*(.+)/i],
+  ['manufacturingPackingDate', 'Manufacturing / packing date', /(?:manufactured|mfg|packed|pack(?:ing)? date|date of packing)\s*[:\-]?\s*(\S+)/i],
+  ['bestBeforeUseByExpiry', 'Best before / use by / expiry', /(?:best before|use by|expiry|expires?)\s*[:\-]?\s*(\S+)/i],
+  ['consumerCare', 'Consumer care', /(?:consumer care|customer care|helpline|contact)\s*[:\-]?\s*(.+)/i],
+  ['countryOfOrigin', 'Country of origin', /(?:country of origin|made in|country)\s*[:\-]?\s*(.+)/i],
 ];
-export function extractFields(ocr: OCRResponse): ExtractedField[] { return definitions.map(([name, label, pattern]) => { const index = ocr.regions.findIndex((r) => pattern.test(r.text)); const region = index >= 0 ? ocr.regions[index] : undefined; const match = region ? region.text.match(pattern) : null; return { name, label, value: match?.[1]?.trim() || (name === 'standardMark' && match ? match[1] : ''), confidence: region?.confidence ?? 0, regionIndex: index >= 0 ? index : null, bbox: region?.bbox ?? null }; }); }
+export function extractFields(ocr: OCRResponse): ExtractedField[] { return definitions.map(([name, label, pattern]) => { const regionIndex = ocr.regions.findIndex((region) => pattern.test(region.text)); const region = regionIndex >= 0 ? ocr.regions[regionIndex] : undefined; const match = region?.text.match(pattern); return { name, label, value: match?.[1]?.trim() ?? '', confidence: region?.confidence ?? 0, regionIndex: regionIndex >= 0 ? regionIndex : null, bbox: region?.bbox ?? null }; }); }
 
-export function evaluateRules(fields: ExtractedField[]): ComplianceRule[] { const get = (name: FieldName) => fields.find((f) => f.name === name); const rules: Array<[string,string,string,FieldName,boolean]> = [
- ['quantity','Net quantity declared','Net quantity should be present and paired with a unit.','netQuantity',Boolean(get('netQuantity')?.value && get('unit')?.value)],
- ['mrp','MRP declaration','Maximum retail price should be visible on the package.','mrp',Boolean(get('mrp')?.value)],
- ['date','Pack date','Packing/manufacturing date should be declared.','packDate',Boolean(get('packDate')?.value)],
- ['batch','Batch identification','Batch or lot number should be traceable.','batchNumber',Boolean(get('batchNumber')?.value)],
- ['origin','Country of origin','Country of origin should be declared.','origin',Boolean(get('origin')?.value)],
- ['care','Customer care details','Consumer contact information should be available.','customerCare',Boolean(get('customerCare')?.value)],
- ['license','License identification','Applicable license number should be present.','licenseNumber',Boolean(get('licenseNumber')?.value)],
- ['mark','Standards mark','A relevant standards mark should be declared where applicable.','standardMark',Boolean(get('standardMark')?.value)],
- ]; return rules.map(([id,title,description,field,ok]) => { const source = get(field); return { id, title, description, status: ok ? 'COMPLIANT' : source?.confidence ? 'POTENTIAL VIOLATION' : 'REQUIRES REVIEW', evidenceRegionIndex: source?.regionIndex ?? null }; }); }
-export function summarizeRules(rules: ComplianceRule[]) { return rules.reduce((s, rule) => { if (rule.status === 'COMPLIANT') s.compliant++; else if (rule.status === 'POTENTIAL VIOLATION') s.potential++; else s.review++; return s; }, { compliant: 0, potential: 0, review: 0 }); }
+const ruleDefinitions: Array<[string, string, string, string, FieldName[], 'LOW'|'MEDIUM'|'HIGH']> = [
+  ['mrp-declaration', 'MRP declaration', 'Price declaration', 'MRP should be visible on the package.', ['mrp'], 'HIGH'],
+  ['net-quantity', 'Net quantity', 'Quantity declaration', 'Net quantity should be visible.', ['netQuantity'], 'HIGH'],
+  ['unit-sale-price', 'Unit sale price', 'Price transparency', 'Unit sale price should be declared where applicable.', ['unitSalePrice'], 'MEDIUM'],
+  ['manufacturer-packer', 'Manufacturer and packer', 'Entity declaration', 'Manufacturer and packer details should be identifiable.', ['manufacturer', 'packer'], 'MEDIUM'],
+  ['date-declaration', 'Date declaration', 'Date declaration', 'Manufacturing/packing date and best-before/use-by/expiry should be reviewable.', ['manufacturingPackingDate', 'bestBeforeUseByExpiry'], 'HIGH'],
+  ['consumer-care', 'Consumer care', 'Consumer information', 'Consumer care contact details should be visible.', ['consumerCare'], 'LOW'],
+  ['country-of-origin', 'Country of origin', 'Origin declaration', 'Country of origin should be visible.', ['countryOfOrigin'], 'MEDIUM'],
+  ['declaration-visibility', 'Declaration visibility', 'Label legibility', 'Required declaration regions should have readable confidence.', ['productName', 'mrp', 'netQuantity'], 'MEDIUM'],
+];
+export function evaluateRules(fields: ExtractedField[]): ComplianceRule[] { const get = (name: FieldName) => fields.find((field) => field.name === name); return ruleDefinitions.map(([id, name, category, reason, required, severity]) => { const sources = required.map(get); const missing = sources.some((field) => !field?.value || field.regionIndex === null); const lowConfidence = sources.some((field) => Boolean(field?.value) && (field?.confidence ?? 0) < .75); const evidence = sources.find((field) => field?.regionIndex !== null)?.regionIndex ?? null; const status = missing || lowConfidence ? 'REQUIRES REVIEW' : 'COMPLIANT'; return { id, name, category, status, reason: missing ? `${reason} Evidence was not found.` : lowConfidence ? `${reason} OCR confidence is below the review threshold.` : reason, severity, evidenceRegionIndex: evidence }; }); }
+export function summarizeRules(rules: ComplianceRule[]) { return rules.reduce((summary, rule) => { if (rule.status === 'COMPLIANT') summary.compliant++; else if (rule.status === 'POTENTIAL VIOLATION') summary.potential++; else summary.review++; return summary; }, { compliant: 0, potential: 0, review: 0 }); }
